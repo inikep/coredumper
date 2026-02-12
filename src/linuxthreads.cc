@@ -107,7 +107,14 @@ static int local_clone(int (*fn)(void *), void *arg, ...) {
    * is being debugged. This is OK and the error code will be reported
    * correctly.
    */
-  return sys_clone(fn, (char *)&arg - 4096, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_UNTRACED, arg, 0, 0, 0);
+  /* Ensure the child stack pointer is 16-byte aligned, as required by
+   * the AArch64 ABI. Without this, the child will get SIGBUS due to a
+   * Stack Alignment Fault (SCTLR_EL1.SA is set on Linux by default).
+   * On other architectures the mask is a no-op since stacks are already
+   * sufficiently aligned.
+   */
+  return sys_clone(fn, (char *)(((unsigned long)&arg - 4096) & ~15UL),
+                   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_UNTRACED, arg, 0, 0, 0);
 }
 
 /* Local substitute for the atoi() function, which is not necessarily safe
@@ -187,7 +194,8 @@ static volatile int *sig_pids, sig_num_threads, sig_proc, sig_marker;
 static void SignalHandler(int signum, siginfo_t *si, void *data) {
   if (sig_pids != NULL) {
     if (signum == SIGABRT) {
-      while (sig_num_threads-- > 0) {
+      while (sig_num_threads > 0) {
+        sig_num_threads = sig_num_threads - 1;
         /* Not sure if sched_yield is really necessary here, but it does not */
         /* hurt, and it might be necessary for the same reasons that we have */
         /* to do so in sys_ptrace_detach().                                  */
@@ -306,7 +314,9 @@ static void ListerThread(struct ListerParams *args) {
      * check there first, and then fall back on the older naming
      * convention if necessary.
      */
-    if ((sig_proc = proc = c_open(*proc_path, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+    proc = c_open(*proc_path, O_RDONLY | O_DIRECTORY, 0);
+    sig_proc = proc;
+    if (proc < 0) {
       if (*++proc_path != NULL) continue;
       goto failure;
     }
@@ -331,9 +341,16 @@ static void ListerThread(struct ListerParams *args) {
       sig_num_threads = num_threads;
       sig_pids = pids;
       for (;;) {
+#if defined(__aarch64__)
+        /* aarch64 has no getdents syscall; use getdents64 */
+        struct kernel_dirent64 *entry;
+        char buf[4096];
+        ssize_t nbytes = sys_getdents64(proc, (struct kernel_dirent64 *)buf, sizeof(buf));
+#else
         struct kernel_dirent *entry;
         char buf[4096];
         ssize_t nbytes = sys_getdents(proc, (struct kernel_dirent *)buf, sizeof(buf));
+#endif
         if (nbytes < 0)
           goto failure;
         else if (nbytes == 0) {
@@ -349,8 +366,13 @@ static void ListerThread(struct ListerParams *args) {
           }
           break;
         }
+#if defined(__aarch64__)
+        for (entry = (struct kernel_dirent64 *)buf; entry < (struct kernel_dirent64 *)&buf[nbytes];
+             entry = (struct kernel_dirent64 *)((char *)entry + entry->d_reclen)) {
+#else
         for (entry = (struct kernel_dirent *)buf; entry < (struct kernel_dirent *)&buf[nbytes];
              entry = (struct kernel_dirent *)((char *)entry + entry->d_reclen)) {
+#endif
           if (entry->d_ino != 0) {
             const char *ptr = entry->d_name;
             pid_t pid;

@@ -40,7 +40,7 @@
 /* We currently only support x86-32 and x86-64 on Linux. Porting to other
  * related platforms should not be difficult.
  */
-#if (defined(__i386__) || defined(__x86_64__) || defined(__ARM_ARCH_3__) || defined(__mips__) || defined(__PPC__)) && \
+#if (defined(__i386__) || defined(__x86_64__) || defined(__ARM_ARCH_3__) || defined(__mips__) || defined(__PPC__) || defined(__aarch64__)) && \
     defined(__linux)
 
 /* Define the THREADS symbol to make sure that there is exactly one core dumper

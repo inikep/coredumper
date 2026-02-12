@@ -67,6 +67,18 @@ extern "C" {
 #define AT_SYSINFO_EHDR 33
 #endif
 
+#ifndef PTRACE_GETREGSET
+#define PTRACE_GETREGSET 0x4204
+#endif
+
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+
+#ifndef NT_PRFPREG
+#define NT_PRFPREG 2
+#endif
+
 #ifndef O_LARGEFILE
 #if defined(__mips__)
 #define O_LARGEFILE 0x2000
@@ -149,6 +161,15 @@ typedef struct fpregs {
   uint32_t fir;
 } fpregs;
 #define regs mips_regs
+#elif defined(__aarch64__)
+typedef struct fpxregs { /* No extended FPU registers concept on aarch64 */
+} fpxregs;
+typedef struct fpregs {   /* NEON/FP registers                           */
+  __uint128_t vregs[32]; /* 32x128-bit SIMD registers                   */
+  uint32_t fpsr;          /* Floating-point status register              */
+  uint32_t fpcr;          /* Floating-point control register             */
+} fpregs;
+#define regs aarch64_regs /* General purpose registers                   */
 #endif
 
 typedef struct elf_timeval { /* Time value with microsecond resolution    */
@@ -156,11 +177,16 @@ typedef struct elf_timeval { /* Time value with microsecond resolution    */
   long tv_usec;              /* Microseconds                              */
 } elf_timeval;
 
+/* On aarch64, signal.h -> sys/ucontext.h -> sys/procfs.h already defines
+ * struct elf_siginfo, so we must not redefine it.
+ */
+#if !defined(__aarch64__)
 typedef struct elf_siginfo { /* Information about signal (unused)         */
   int32_t si_signo;          /* Signal number                             */
   int32_t si_code;           /* Extra code                                */
   int32_t si_errno;          /* Errno                                     */
 } elf_siginfo;
+#endif
 
 typedef struct prstatus {   /* Information about thread; includes CPU reg*/
   elf_siginfo pr_info;      /* Info associated with signal               */
@@ -185,7 +211,7 @@ typedef struct prpsinfo { /* Information about process                 */
   unsigned char pr_zomb;  /* Zombie                                    */
   signed char pr_nice;    /* Nice val                                  */
   unsigned long pr_flag;  /* Flags                                     */
-#if defined(__x86_64__) || defined(__mips__)
+#if defined(__x86_64__) || defined(__mips__) || defined(__aarch64__)
   uint32_t pr_uid; /* User ID                                   */
   uint32_t pr_gid; /* Group ID                                  */
 #else
@@ -201,7 +227,7 @@ typedef struct prpsinfo { /* Information about process                 */
 } prpsinfo;
 
 typedef struct core_user { /* Ptrace returns this data for thread state */
-#ifndef __mips__
+#if !defined(__mips__) && !defined(__aarch64__)
   struct regs regs;      /* CPU registers                             */
   unsigned long fpvalid; /* True if math co-processor being used      */
 #if defined(__i386__) || defined(__x86_64__)
@@ -255,6 +281,8 @@ typedef struct core_user { /* Ptrace returns this data for thread state */
 #define ELF_ARCH EM_ARM
 #elif defined(__mips__)
 #define ELF_ARCH EM_MIPS
+#elif defined(__aarch64__)
+#define ELF_ARCH EM_AARCH64
 #endif
 
 /* Wrap a class around system calls, in order to give us access to
@@ -1546,6 +1574,25 @@ static inline int GetParentRegs(void *frame, regs *cpu, fpregs *fp, fpxregs *fpx
   pid_t pid = getppid();
   if (sys_ptrace(PTRACE_ATTACH, pid, (void *)0, (void *)0) == 0 && waitpid(pid, (void *)0, __WALL) >= 0) {
     memset(scratch, 0xFF, sizeof(scratch));
+#if defined(__aarch64__)
+    /* aarch64 uses PTRACE_GETREGSET with NT_PRSTATUS/NT_PRFPREG */
+    {
+      struct iovec iov;
+      iov.iov_base = scratch;
+      iov.iov_len = sizeof(struct regs);
+      if (sys_ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) == 0) {
+        memcpy(cpu, scratch, sizeof(struct regs));
+        SET_FRAME(*(Frame *)frame, *cpu);
+        iov.iov_base = scratch;
+        iov.iov_len = sizeof(struct fpregs);
+        if (sys_ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRFPREG, &iov) == 0) {
+          memcpy(fp, scratch, sizeof(struct fpregs));
+          *hasSSE = 0;
+          rc = 1;
+        }
+      }
+    }
+#else
     if (sys_ptrace(PTRACE_GETREGS, pid, scratch, scratch) == 0) {
       memcpy(cpu, scratch, sizeof(struct regs));
       SET_FRAME(*(Frame *)frame, *cpu);
@@ -1566,6 +1613,7 @@ static inline int GetParentRegs(void *frame, regs *cpu, fpregs *fp, fpxregs *fpx
         rc = 1;
       }
     }
+#endif
   }
   sys_ptrace_detach(pid);
 
@@ -1678,6 +1726,31 @@ int InternalGetCoreDump(void *frame, int num_threads, pid_t *pids,
       SET_FRAME(*(Frame *)frame, thread_regs[i]);
     }
     hasSSE = 0;
+#elif defined(__aarch64__)
+    /* aarch64 uses PTRACE_GETREGSET with NT_PRSTATUS/NT_PRFPREG */
+    {
+      struct iovec iov;
+      iov.iov_base = scratch;
+      iov.iov_len = sizeof(struct regs);
+      if (sys_ptrace(PTRACE_GETREGSET, pids[i], (void *)(uintptr_t)NT_PRSTATUS, &iov) == 0) {
+        memcpy(thread_regs + i, scratch, sizeof(struct regs));
+        if (main_pid == pids[i]) {
+          SET_FRAME(*(Frame *)frame, thread_regs[i]);
+        }
+        iov.iov_base = scratch;
+        iov.iov_len = sizeof(struct fpregs);
+        if (sys_ptrace(PTRACE_GETREGSET, pids[i], (void *)(uintptr_t)NT_PRFPREG, &iov) == 0) {
+          memcpy(thread_fpregs + i, scratch, sizeof(struct fpregs));
+          hasSSE = 0;
+        } else {
+          goto ptrace;
+        }
+      } else {
+      ptrace:
+        ResumeAllProcessThreads(threads, pids);
+        goto error;
+      }
+    }
 #else
     memset(scratch, 0xFF, sizeof(scratch));
     if (sys_ptrace(PTRACE_GETREGS, pids[i], scratch, scratch) == 0) {
@@ -1712,7 +1785,7 @@ int InternalGetCoreDump(void *frame, int num_threads, pid_t *pids,
 
   /* Get parent's CPU registers, and user data structure                     */
   {
-#ifndef __mips__
+#if !defined(__mips__) && !defined(__aarch64__)
     for (i = 0; i < sizeof(struct core_user); i += sizeof(int)) {
       sys_ptrace(PTRACE_PEEKUSER, pids[0], (void *)i, ((char *)&user) + i);
     }

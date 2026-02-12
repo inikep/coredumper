@@ -40,7 +40,7 @@ extern "C" {
 /* We currently only support x86-32, x86-64, ARM, and MIPS on Linux.
  * Porting to other related platforms should not be difficult.
  */
-#if (defined(__i386__) || defined(__x86_64__) || defined(__ARM_ARCH_3__) || defined(__mips__)) && defined(__linux)
+#if (defined(__i386__) || defined(__x86_64__) || defined(__ARM_ARCH_3__) || defined(__mips__) || defined(__aarch64__)) && defined(__linux)
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -105,6 +105,17 @@ typedef struct mips_regs {
   unsigned long cp0_cause;
   unsigned long unused;
 } mips_regs;
+#elif defined(__aarch64__)
+typedef struct aarch64_regs { /* General purpose registers                 */
+#define BP uregs[29]          /* Frame pointer (x29)                       */
+#define SP sp_el0             /* Stack pointer                             */
+#define IP pc_reg             /* Program counter                           */
+#define LR uregs[30]          /* Link register (x30)                       */
+  uint64_t uregs[31];        /* x0-x30                                    */
+  uint64_t sp_el0;           /* Stack pointer                             */
+  uint64_t pc_reg;           /* Program counter                           */
+  uint64_t pstate;           /* CPSR / PSTATE                             */
+} aarch64_regs;
 #endif
 
 #if defined(__i386__) && defined(__GNUC__)
@@ -331,6 +342,51 @@ typedef struct Frame {
     (r).hi = (f).mips_regs.hi;                                          \
     (r).lo = (f).mips_regs.lo;                                          \
     (r).cp0_epc = (f).mips_regs.cp0_epc;                                \
+  } while (0)
+#elif defined(__aarch64__) && defined(__GNUC__)
+/* AArch64: capture all general-purpose registers.
+ */
+typedef struct Frame {
+  struct aarch64_regs arm64;
+  int errno_;
+  pid_t tid;
+} Frame;
+#define FRAME(f)                                                       \
+  Frame f;                                                             \
+  do {                                                                 \
+    f.errno_ = errno;                                                  \
+    f.tid = sys_gettid();                                              \
+    __asm__ volatile(                                                  \
+        "stp  x0,  x1,  [%0, #0]\n"                                   \
+        "stp  x2,  x3,  [%0, #16]\n"                                  \
+        "stp  x4,  x5,  [%0, #32]\n"                                  \
+        "stp  x6,  x7,  [%0, #48]\n"                                  \
+        "stp  x8,  x9,  [%0, #64]\n"                                  \
+        "stp  x10, x11, [%0, #80]\n"                                  \
+        "stp  x12, x13, [%0, #96]\n"                                  \
+        "stp  x14, x15, [%0, #112]\n"                                 \
+        "stp  x16, x17, [%0, #128]\n"                                 \
+        "stp  x18, x19, [%0, #144]\n"                                 \
+        "stp  x20, x21, [%0, #160]\n"                                 \
+        "stp  x22, x23, [%0, #176]\n"                                 \
+        "stp  x24, x25, [%0, #192]\n"                                 \
+        "stp  x26, x27, [%0, #208]\n"                                 \
+        "stp  x28, x29, [%0, #224]\n"                                 \
+        "str  x30,      [%0, #240]\n"                                  \
+        "mov  x1, sp\n"                                                \
+        "str  x1,       [%0, #248]\n"   /* sp */                       \
+        "adr  x1, .\n"                                                 \
+        "str  x1,       [%0, #256]\n"   /* pc */                       \
+        "mrs  x1, nzcv\n"                                              \
+        "str  x1,       [%0, #264]\n"   /* pstate */                   \
+        :                                                              \
+        : "r"(&f.arm64)                                                \
+        : "x1", "memory");                                             \
+  } while (0)
+#define SET_FRAME(f, r) \
+  do {                  \
+    errno = (f).errno_; \
+    (r) = (f).arm64;    \
   } while (0)
 #else
 /* If we do not have a hand-optimized assembly version of the FRAME()
